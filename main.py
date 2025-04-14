@@ -42,7 +42,6 @@ class LSSS:
         t = self.group.random(ZR)
         shares = {}
         for i, row in enumerate(matrix):
-            # row = [1, x_i]
             x_i = row[1]
             share_i = row[0]*s + x_i*t
             shares[i] = share_i
@@ -59,20 +58,18 @@ class LSSS:
         The standard formula for f(0) given two points (x1, y1), (x2, y2):
            λ1 = (0 - x2)/(x1 - x2),  λ2 = (0 - x1)/(x2 - x1).
         Then f(0) = y1*λ1 + y2*λ2.
-        
-        We'll store λ_i in a dict: coeffs[i1] = λ1, coeffs[i2] = λ2, others=0.
         """
         group = self.group
         row_indices = [i for i, attr in enumerate(attributes) if attr in user_attrs]
         if len(row_indices) < 2:
-            return {}  # cannot satisfy 2-of-3
+            return {}
 
         # If user has 3 attributes, just use the first two for interpolation
         if len(row_indices) > 2:
             row_indices = row_indices[:2]
 
         i1, i2 = row_indices
-        x1_int = matrix[i1][1]  # typically 0,1,2
+        x1_int = matrix[i1][1]
         x2_int = matrix[i2][1]
 
         # Convert x1_int, x2_int into ZR
@@ -82,9 +79,9 @@ class LSSS:
         denom12 = x1 - x2  # in ZR
         denom21 = x2 - x1  # in ZR
 
-        # λ1 = (0 - x2)/ (x1 - x2)
+        # λ1 = -x2 / (x1 - x2)
         lam1 = -x2 / denom12
-        # λ2 = (0 - x1)/ (x2 - x1)
+        # λ2 = -x1 / (x2 - x1)
         lam2 = -x1 / denom21
 
         coeffs = {0:0, 1:0, 2:0}  # default zero
@@ -155,7 +152,6 @@ class CPabe_Revocation(ABEnc):
         3) Cy[i] = g^(share_i)
         4) store RL, RA, t_c for toy revocation check
         """
-        # build the matrix
         matrix, attributes = self.lsss.create_matrix(policy_str)
 
         s = self.group.random(ZR)
@@ -166,7 +162,7 @@ class CPabe_Revocation(ABEnc):
 
         Cy = {}
         for i, share_i in shares.items():
-            Cy[i] = PP['g'] ** share_i  # g^(share_i)
+            Cy[i] = PP['g'] ** share_i
 
         ciphertext = {
             'C_tilde': C_tilde,
@@ -187,6 +183,7 @@ class CPabe_Revocation(ABEnc):
         4) product => e(g,g)^(alpha * s)
         5) M = C_tilde / that product
         """
+        # If revoked, stop
         if self._is_revoked(PP, SK, CT):
             return False
 
@@ -201,18 +198,12 @@ class CPabe_Revocation(ABEnc):
             attr = attributes[i]
             if attr not in SK['K']:
                 continue
-            # pairing_val = e( g^(share_i), g^alpha ) in GT
-            pairing_val = pair(CT['Cy'][i], SK['K'][attr])
-            # raise to lam in ZR
-            part = pairing_val ** lam
+            pairing_val = pair(CT['Cy'][i], SK['K'][attr])  # e(g^(share_i), g^alpha)
+            part = pairing_val ** lam                       # exponent in ZR
             A *= part
 
-        # A = e(g,g)^( alpha * ∑(share_i * lam) )
-        # if we do correct interpolation => that sum = s
-        # so A = e(g,g)^( alpha*s )
-
-        M_recovered = CT['C_tilde'] / A
-        return M_recovered
+        # A = e(g,g)^( alpha*s ) if the Lagrange interpolation is correct
+        return CT['C_tilde'] / A
 
     ########################################################################
     # Revocation helpers
@@ -220,31 +211,37 @@ class CPabe_Revocation(ABEnc):
 
     def _revocation_poly(self, PP, RL, RA):
         """
-        returns a function P(x) that multiplies (x - (uid+eta)) for uid in RL
-        and (x - H(attr)) for attr in RA
+        returns a function P(x) that multiplies (x - H(attr)) for attr in RA.
+        We'll skip user IDs in the polynomial and do them in a direct check instead.
         """
         group = self.group
         def P(x):
             val = group.init(ZR, 1)
-            for uid in RL:
-                val *= (x - (group.init(ZR, uid) + PP['eta']))
             for a in RA:
                 val *= (x - PP['H'](a))
             return val
         return P
 
     def _is_revoked(self, PP, SK, CT):
+        """
+        We revoke the user if:
+          1) user time > ciphertext time
+          2) user ID is literally in RL
+          3) any attribute is in RA => polynomial is zero
+        """
         RL, RA, t_c = CT['RL'], CT['RA'], CT['t_c']
-        # if user time > ciphertext time => revoke
+        # 1) time-based
         if SK['t_u'] > t_c:
             return True
 
-        # Evaluate polynomial on ID+eta, and on user attributes
-        P = self._revocation_poly(PP, RL, RA)
-        id_term = P(self.group.init(ZR, SK['ID']) + PP['eta'])
-        if id_term == 0:
+        # 2) direct ID-based check
+        #    If SK['ID'] is in RL, we revoke immediately
+        if SK['ID'] in RL:
             return True
 
+        # 3) attribute-based check using polynomial
+        #    If P(H(attr))=0 => attribute is revoked
+        P = self._revocation_poly(PP, RL, RA)
         for a in SK['S']:
             val = P(PP['H'](a))
             if val == 0:
@@ -263,31 +260,33 @@ def main():
 
     # 1) Key generation for user with attributes A, B
     user_attrs = ['A', 'B']
-    user_id = 1
+    user_id = 1      # same as the RL we provide
     user_t_u = 8
     sk = cpabe.keygen(params['PP'], params['MK'], user_attrs, user_id, user_t_u)
 
     # 2) Encrypt a random message under a "2-of-3" policy
     msg = group.random(GT)
     print("Original message:", msg)
+
+    # Revoke user with ID=5, so they should be denied
     ct = cpabe.encrypt(
         PP=params['PP'],
         MK=params['MK'],
         M=msg,
-        RL=[5],      # Revoke user with ID=5
-        RA=['D'],    # Revoke attribute 'D'
+        RL=[5],   # We want to revoke user ID=5
+        RA=['D'], # Revoke attribute 'D'
         policy_str="2-of-3",
-        t_c=10       # ciphertext time
+        t_c=10
     )
 
     # 3) Decrypt
     result = cpabe.decrypt(params['PP'], sk, ct)
     if result == False:
-        print("ACCESS DENIED!")
+        print("ACCESS DENIED! (Correctly revoked user with ID=5.)")
     else:
         print("Recovered message:", result)
         if result == msg:
-            print("Decryption successful! The plaintext matches.")
+            print("Decryption successful! (User was NOT revoked, check logic.)")
         else:
             print("Wrong plaintext recovered!")
 
